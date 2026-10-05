@@ -1,12 +1,16 @@
 # Finance Documents AI Pipeline on Databricks
 
-An end-to-end data pipeline that turns unstructured **PDF documents** (invoices, purchase orders and receipts) into **structured, queryable tables**, using Databricks AI Functions, Unity Catalog and the **Medallion Architecture**.
+**Project by Yehya ABOU KHECHFE**
+
+An **automated, end-to-end data pipeline** that turns unstructured **PDF documents** (invoices, purchase orders and receipts) into **structured, business-ready tables**, using Databricks AI Functions, Unity Catalog, the **Medallion Architecture** and **Databricks Jobs**.
+
+Drop a PDF into the raw storage volume, and the pipeline does the rest: it parses, classifies and extracts the document, cleans the data, and refreshes the business tables, with no manual step.
 
 ---
 
-##  The Idea
+## The Idea
 
-Companies receive many financial documents as PDFs: invoices from suppliers, purchase orders, payment receipts. The information inside them (amounts, dates, suppliers, line items) is valuable, but it is locked in files that cannot be queried with SQL.
+Companies receive many financial documents as PDFs: invoices from suppliers, purchase orders, payment receipts. The information inside them (amounts, dates, vendors, line items) is valuable, but it is locked in files that cannot be queried with SQL, and reading them by hand is slow and error-prone.
 
 This project automates the whole process:
 
@@ -14,27 +18,42 @@ This project automates the whole process:
 2. **Parse** each document with AI to understand its layout and content.
 3. **Classify** each document as an invoice, a purchase order or a receipt.
 4. **Extract** the relevant fields for each document type into structured tables.
-5. **Clean and model** the data for analytics and dashboards (next steps).
+5. **Clean** the extracted data so it can be trusted.
+6. **Build business tables** that answer real questions: how much we spend, with whom, and whether invoices match purchase orders.
+7. **Automate** everything with a Databricks Job that runs as soon as new files arrive.
 
-The result: documents that used to require manual reading become rows and columns that can be analyzed, joined and visualized.
+The result: documents that used to require manual reading become rows and columns that can be analyzed, joined and visualized, automatically.
 
 ---
 
-##  Architecture
+## Tech Stack
+
+- **Databricks** (notebooks, serverless compute)
+- **Unity Catalog** (catalog, schemas, volumes, tables)
+- **Databricks SQL** and **AI Functions**: `ai_parse_document()`, `ai_classify()`, `ai_extract()`
+- **Delta Lake** tables
+- **Databricks Jobs** for orchestration, with a file arrival trigger
+
+---
+
+## Architecture
 
 The project follows the **modern Databricks data workflow** and the **Medallion Architecture**, a layered design recommended by Databricks where data becomes cleaner and more valuable at each step.
 
 ```
-   PDF files                 BRONZE                         SILVER                    GOLD
- (invoices, POs,  ──►  Parsed, classified and   ──►   Cleaned and validated   ──►  Business-ready
-    receipts)          extracted documents             structured tables          tables & KPIs
+   PDF files                 BRONZE                     SILVER                  GOLD
+ (invoices, POs,  ──►  Parsed, classified and  ──►  Cleaned, typed and  ──►  Business-ready
+    receipts)          extracted documents          validated tables         tables & KPIs
+       ▲
+       └── a new file in the raw volume triggers the whole pipeline automatically
 ```
 
-| Layer | Purpose | Status |
+| Layer | Purpose | Notebook |
 |---|---|---|
-| **Bronze** | Raw files and their first AI-processed version (parsed, classified, extracted) | ✅ Done |
-| **Silver** | Cleaned data: correct types, standardized formats, quality checks | 🔜 Next step |
-| **Gold** | Aggregated, business-ready tables for dashboards | 🔜 Planned |
+| **Bronze** | Raw files and their first AI-processed version (parsed, classified, extracted) | [1_Prepare_Bronze_Layer](notebooks/1_Prepare_Bronze_Layer.ipynb) |
+| **Silver** | Cleaned data: correct types, standardized formats, quality checks | [2_Bronze_To_Silver_Transformations](notebooks/2_Bronze_To_Silver_Transformations.ipynb) |
+| **Gold** | Aggregated, business-ready tables for dashboards | [3_Silver_To_Gold](notebooks/3_Silver_To_Gold.ipynb) |
+| **Orchestration** | Databricks Job running the three notebooks in order, triggered by new files | — |
 
 ### Data organization in Unity Catalog
 
@@ -47,99 +66,51 @@ medical_finance                          ← catalog
 │   ├── purchase_orders                  ← one row per purchase order
 │   ├── receipts                         ← one row per receipt
 │   └── invoice_line_items               ← one row per product/service line of each invoice
-├── silver_layer                         ← cleaned tables (next step)
-└── gold_layer                           ← business tables (planned)
+├── silver_layer                         ← cleaned tables
+└── gold_layer                           ← business tables
 ```
 
 ---
 
-##  What Has Been Done So Far
+## Orchestration: the Databricks Job
 
-All the work below is in the notebook **`Prepare_Bronze_Layer`**, which prepares the data before the cleaning step.
+The three notebooks are orchestrated by a **Databricks Job**, so the pipeline runs **automatically, in the right order**.
 
-### Step 1: Store the raw documents
-The PDF files are uploaded to a **Unity Catalog volume**, the place for unstructured files in Databricks. They are read as binary content with `read_files(..., format => 'binaryFile')`.
+![Databricks Job with three tasks: Prepare_Bronze, Prepare_Silver_Tables and Ready_To_Use_Table](https://github.com/user-attachments/assets/58743db5-5e8e-4e17-bb9b-6a9dcecaf426)
 
-### Step 2: Parse the documents
-Each PDF is parsed with **`ai_parse_document()`**, which identifies the layout of the document (titles, paragraphs, tables) and returns it as a structured `VARIANT`.
+### Tasks
 
-A readable text version of each document is also created by joining the content of all its elements:
+| Order | Task | Notebook | What it does |
+|---|---|---|---|
+| 1 | **Prepare_Bronze** | [1_Prepare_Bronze_Layer](notebooks/1_Prepare_Bronze_Layer.ipynb) | Parses, classifies and extracts the new documents |
+| 2 | **Prepare_Silver_Tables** | [2_Bronze_To_Silver_Transformations](notebooks/2_Bronze_To_Silver_Transformations.ipynb) | Cleans the extracted data |
+| 3 | **Ready_To_Use_Table** | [3_Silver_To_Gold](notebooks/3_Silver_To_Gold.ipynb) | Builds the business-ready gold tables |
 
-```sql
-concat_ws('\n',
-  transform(
-    try_cast(parsed_content:document:elements AS ARRAY<VARIANT>),
-    x -> try_cast(x:content AS STRING)
-  )
-)
-```
-
-### Step 3: Classify the documents
-Each document is classified with **`ai_classify()`** into one of these categories: invoice, purchase order, receipt or other.
-
-The result is saved in the table **`documents_parsed_classified`**, which contains, for each document:
-
-| Column | Description |
-|---|---|
-| `path` | Location of the original file |
-| `parsed_content` | Full output of `ai_parse_document()` |
-| `element_pretty_format` | Readable text version of the document |
-| `document_type` | Category assigned by `ai_classify()` |
-
-### Step 4: Extract structured data by document type
-Using **`ai_extract()`**, a different extraction schema is applied to each document type:
-
-| Table | Main fields extracted |
-|---|---|
-| `invoices` | invoice number, invoice date, PO number, seller, seller email, buyer, shipping address, payment method, currency, total amount |
-| `purchase_orders` | PO number, PO date, requested ship date, buyer, vendor, currency, subtotal, shipping, total amount |
-| `receipts` | receipt number, payment date, seller, amount paid, payment method |
-| `invoice_line_items` | invoice number, description, quantity, unit price, line amount |
-
-Line items are extracted as an **array** and turned into one row per item with `EXPLODE`.
-
----
-
-##  Next Steps
-
-- [ ] **Silver layer:** clean the bronze tables (convert dates to `DATE`, amounts to `DECIMAL`, standardize text, remove duplicates, handle missing values)
-- [ ] **Quality checks:** compare the sum of invoice line items with the invoice total, and flag documents with extraction errors or missing fields
-- [ ] **Gold layer:** build business tables such as spend by vendor, monthly spend, and unpaid invoices (invoices without a matching receipt)
-- [ ] **Dashboard:** visualize the gold tables with a Databricks AI/BI dashboard
-- [ ] **Orchestration:** create a Databricks **Job** with a **file arrival trigger**, so the pipeline runs automatically whenever new documents are added to the volume
-
----
-
-##  Tech Stack
-
-- **Databricks** (notebooks, serverless compute)
-- **Unity Catalog** (catalog, schemas, volumes, tables)
-- **Databricks SQL** and **AI Functions**: `ai_parse_document()`, `ai_classify()`, `ai_extract()`
-- **Delta Lake** tables
-- **Databricks Jobs** for orchestration (planned)
-
----
-
-##  Repository Structure
+### Dependency chain
 
 ```
-├── README.md
-└── notebooks/
-    └── Prepare_Bronze_Layer      ← parsing, classification and extraction (bronze layer)
+Prepare_Bronze  ──►  Prepare_Silver_Tables  ──►  Ready_To_Use_Table
 ```
 
+Each task starts **only after the previous one has succeeded**. This guarantees that the silver tables are never built from incomplete bronze data, and that the gold tables are never built from data that has not been cleaned yet. If a task fails, the next ones do not run.
+
+### Trigger: file arrival
+
+The Job uses a **file arrival trigger** (an event-based trigger) on the Unity Catalog **volume that contains the raw files**.
+
+- When new PDF files are dropped into the volume, the Job **starts automatically**.
+- No fixed schedule is needed: the pipeline runs **only when there is new data**, which avoids useless runs and saves compute.
+
+### Compute
+
+All tasks run on **serverless compute**: Databricks manages and scales the resources automatically, with no cluster to configure.
+
 ---
 
-## Data Privacy
-
-This repository contains **code only**. The documents used for this project are **sample documents** with invented companies and amounts. No real personal or financial data is published.
-
----
-
-##  What I Learned
+## What I Learned
 
 - Organizing data with Unity Catalog: catalogs, schemas, volumes and tables
 - Designing a pipeline with the Medallion Architecture
 - Processing unstructured documents with Databricks AI Functions
 - Working with semi-structured `VARIANT` data in SQL (`:`, `::`, `try_cast`, `transform`, `concat_ws`, `EXPLODE`)
-- Preparing a pipeline for automation with Databricks Jobs and triggers
+- Orchestrating a pipeline with Databricks Jobs, task dependencies and event-based triggers
